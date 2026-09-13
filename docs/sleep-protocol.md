@@ -8,16 +8,26 @@ options are keyword-only:
 run_sleep_cycle(
     db_path, limit=None, model_fn=None, background_dream=False,
     max_edges=100_000, cross_source_only=False, *, embedding_client=None,
-    embedding_model=None, expected_dimension=None,
+    embedding_model=None, expected_dimension=None, auto_embed=True,
     journal_policy="manage", orphan_limit=None, orphan_batch_size=100,
 )
 ```
 
-Orphan repair is caller-owned. When repair is enabled, provide all three of
-`embedding_client`, `embedding_model`, and `expected_dimension`. The client
-must implement `encode(list[str])` and return a NumPy array with exactly one
-finite, non-zero row per input and the requested dimension. Sleep does not
-construct a model, select a device, or call a default embedding service.
+By default, sleep lazily uses the configured model through the existing
+`LocalBackend`. The model loads only when an orphan needs encoding; an empty
+cycle or index repair from stored vectors does not load it. Existing CLI and
+`SleepProtocol` callers retain automatic orphan embedding.
+
+Adapters can supply all three of `embedding_client`, `embedding_model`, and
+`expected_dimension`. The client must implement `encode(list[str])` and return
+one finite, non-zero vector of the requested dimension per input. Tiny non-zero
+vectors are accepted; exactly zero vectors are invalid for cosine similarity.
+An injected client is authoritative: failure never triggers a local fallback.
+Set `auto_embed=False` to prohibit automatic encoding when no client is supplied;
+eligible unrepaired orphans then produce an unavailable/partial outcome. Process-
+isolating hosts should set this explicitly, including when forwarding a client.
+`SleepProtocol.run_sleep_cycle` forwards this option as well.
+
 Invalid output is rejected before any node write. Each valid node is written
 to `embeddings` and `vec_embeddings` inside one savepoint, and each batch is
 committed independently. If the vec index is present and rejects a write, the
@@ -28,6 +38,12 @@ repairs all eligible rows in batches of 100 for backward compatibility.
 `orphan_batch_size` may reduce the encode/commit batch below 100. A table merely
 named `vec_embeddings` is not a vec capability: it must be a `vec0` virtual
 table that can be loaded and queried on the active connection.
+
+Index repair preserves stored model identity and dimensions. It deliberately
+rejects rows from a different model, even when dimensions match. Sleep is not a
+model migration tool: complete Cashew's re-embedding migration before resuming
+maintenance with a changed model. Matching rows can still be repaired in a mixed
+batch; rejected rows are counted without relabeling their vectors.
 
 When `limit` caps candidate discovery, sleep persists a private cursor and
 rotates deterministically through `(timestamp, node_id)` pages. Cursor claims
@@ -40,6 +56,15 @@ rows reset to the deterministic origin. Capped orphan work has separate durable
 ordinary and vec-repair cursors and alternates which phase receives the first
 share of the cap. A repeatedly failing oldest batch therefore cannot starve
 later rows or the other repair class forever.
+
+The `_cashew_sleep_state` table belongs to Cashew sleep, not the host adapter.
+It contains only disposable progress cursors, not memories. Uncapped calls do
+not create it. Schema checking stays on the cycle connection so cursor claims
+and recovery share its transaction; moving it to startup-only schema setup would
+miss malformed state encountered by standalone callers. Future schema changes
+must preserve valid cursors or reset them safely and keep the migration and
+contention tests. Resetting this state can repeat work but must never delete
+thoughts, embeddings, or graph edges.
 
 ## Supported work envelope
 

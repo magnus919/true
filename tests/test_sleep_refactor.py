@@ -132,9 +132,14 @@ def _make_test_db(with_embeddings=True) -> str:
 @pytest.fixture(autouse=True)
 def _pin_expected_dim_to_384():
     """All test embeddings in this file are 384-dim. Pin
-    `_resolve_expected_dim` so tests pass regardless of the host's
-    configured default embedding model."""
-    with patch("core.sleep._resolve_expected_dim", return_value=384):
+    the MiniLM profile and encoder so tests neither use host model settings
+    nor load a native embedding model."""
+    with (
+        patch("core.sleep._resolve_expected_dim", return_value=384),
+        patch("core.config.get_embedding_model", return_value="all-MiniLM-L6-v2"),
+        patch("core.embedding_service.LocalBackend.encode",
+              side_effect=lambda texts: np.array([_make_embedding(i + 100) for i in range(len(texts))])),
+    ):
         yield
 
 
@@ -162,20 +167,20 @@ def db_with_embeddings():
 
     # Insert embeddings — controlled similarity values:
     # v1 (nodes 0,2,6): identical → dedup  (sim = 1.0)
-    # v2 (nodes 1,3,7): mixed vector with sim ≈ 0.92 → cross-link with v1
-    #   (in the [CROSS_LINK_THRESHOLD, DEDUP_THRESHOLD) = [0.90, 0.94) band)
+    # v2 (nodes 1,3,7): mixed vector with sim ≈ 0.80 → cross-link with v1
+    #   (in the [CROSS_LINK_THRESHOLD, DEDUP_THRESHOLD) = [0.70, 0.90) band)
     # v3 (nodes 4,5,8,9): random → low or no similarity
     ref_vec = _make_embedding(0)
     orth = _make_embedding(999)
     # Make orth orthogonal to ref_vec
     orth = orth - np.dot(orth, ref_vec) * ref_vec
     orth = orth / np.linalg.norm(orth)
-    mixed = 0.92 * ref_vec + np.sqrt(1 - 0.92**2) * orth
+    mixed = 0.80 * ref_vec + np.sqrt(1 - 0.80**2) * orth
     random_vec = _make_embedding(42)
 
     vecs_by_group = [
         ref_vec,    # group 0: dedup (identical to ref)
-        mixed,      # group 1: cross-link candidate with ref (~0.75)
+        mixed,      # group 1: cross-link candidate with ref (~0.80)
         ref_vec,    # group 2: dedup
         mixed,      # group 3: cross-link
         random_vec, # group 4: orthogonal (no link)

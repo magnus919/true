@@ -350,8 +350,8 @@ def test_public_cycle_counts_commit_that_succeeds_before_wrapper_error(
 
     monkeypatch.setattr(sleep_module.sqlite3, "connect", connect)
     result = run_sleep_cycle(db_path=str(path), journal_policy="preserve")
-    assert result["status"] == "partial"
-    assert result["error"] == "cross_link_failed"
+    assert result["status"] == "completed"
+    assert result["error"] is None
     assert result["cross_links_created"] == 1
     assert result["cross_link_directed_rows"] == 2
     check = real_connect(str(path))
@@ -1457,3 +1457,137 @@ def test_result_contract_no_llm_has_skipped_dream(tmp_path):
     )
     assert result["status"] == "unavailable"
     assert result["error"] == "too_few_embeddings"
+
+
+@pytest.mark.parametrize('mode', ['default', 'injected', 'disabled', 'failure'])
+def test_public_orphan_encoder_policy(tmp_path, monkeypatch, mode):
+    import core.config as config_module
+    from core.embedding_service import LocalBackend
+
+    conn = _orphan_db(tmp_path, dimension=384)
+    conn.close()
+    monkeypatch.setattr(config_module, 'get_embedding_model', lambda: 'all-MiniLM-L6-v2')
+    calls = []
+
+    def encode(self, texts):
+        calls.append((self.model_name, texts))
+        if mode == 'failure':
+            raise RuntimeError('encoder unavailable')
+        return np.ones((len(texts), 384), dtype=np.float32)
+
+    monkeypatch.setattr(LocalBackend, 'encode', encode)
+    kwargs = {}
+    client = _Client(lambda n: np.ones((n, 384), dtype=np.float32))
+    if mode == 'injected':
+        kwargs = dict(embedding_client=client, embedding_model='all-MiniLM-L6-v2',
+                      expected_dimension=384)
+    elif mode == 'disabled':
+        kwargs = dict(auto_embed=False)
+    result = run_sleep_cycle(str(tmp_path / 'orphans.db'), journal_policy='preserve', **kwargs)
+    check = sqlite3.connect(str(tmp_path / 'orphans.db'))
+    rows = check.execute('SELECT model FROM embeddings').fetchall()
+    check.close()
+    if mode in {'default', 'injected'}:
+        assert rows == [('all-MiniLM-L6-v2',)]
+        assert result['orphans_embedded'] == 1
+    else:
+        assert rows == []
+    assert bool(calls) == (mode in {'default', 'failure'})
+    if mode == 'failure':
+        assert result['error'] == 'orphan_write_failed'
+
+
+@pytest.mark.parametrize('repair', [False, True])
+@pytest.mark.parametrize('value,valid', [(1e-9, True), (0.0, False), (float('nan'), False)])
+def test_orphan_tiny_vectors_and_exact_zero(tmp_path, repair, value, valid):
+    conn = _orphan_db(tmp_path)
+    vector = np.full(4, value, dtype=np.float32)
+    if repair:
+        conn.execute("INSERT INTO embeddings VALUES ('n1', ?, 'm', datetime('now'))",
+                     (vector.tobytes(),))
+        conn.commit()
+    stats = {}
+    count = _embed_orphans(conn, embedding_client=_Client(lambda n: np.tile(vector, (n, 1))),
+                           embedding_model='m', expected_dimension=4, stats=stats)
+    assert count == int(valid)
+    assert stats['orphan_write_failed'] == int(not valid)
+    conn.close()
+
+
+def test_verified_cross_link_commit_has_no_failed_count(tmp_path):
+    class PostCommitError(sqlite3.Connection):
+        fail = False
+
+        def commit(self):
+            super().commit()
+            if self.fail:
+                raise sqlite3.OperationalError('raised after commit')
+    conn = _edge_db(tmp_path, factory=PostCommitError)
+    conn.fail = True
+    stats = _batch_cross_links(conn, ['a', 'b'], np.array([[0, 1]]), np.eye(2))
+    assert stats['created'] == 1
+    assert stats['failed'] == 0
+    assert len(stats['dream_pairs']) == 1
+    conn.close()
+
+
+def test_default_encoder_is_lazy_without_orphans(tmp_path, monkeypatch):
+    from core.embedding_service import LocalBackend
+    monkeypatch.setattr(LocalBackend, '_ensure_model', lambda self: pytest.fail('model loaded'))
+    _neutralize_post_pair_phases(monkeypatch)
+    result = run_sleep_cycle(str(_cycle_db(tmp_path)), journal_policy='preserve')
+    assert result['status'] == 'completed'
+
+
+def test_invalid_auto_embed_rejected_before_open(monkeypatch):
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: pytest.fail('database opened'))
+    assert run_sleep_cycle('unused', auto_embed='false')['error'] == 'invalid_auto_embed'
+
+
+def test_cli_default_cycle_embeds_orphans(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    import core.config as config_module
+    from core.embedding_service import LocalBackend
+    from scripts import cashew_context
+
+    conn = _orphan_db(tmp_path, dimension=384)
+    conn.execute("INSERT INTO thought_nodes(id, content) VALUES ('n2', 'second')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(config_module, 'get_embedding_model', lambda: 'all-MiniLM-L6-v2')
+    monkeypatch.setattr(cashew_context, '_build_model_fn', lambda: None)
+    monkeypatch.setattr(LocalBackend, 'encode', lambda self, texts: np.eye(len(texts), 384, dtype=np.float32))
+    _neutralize_post_pair_phases(monkeypatch)
+    cashew_context.cmd_complete_sleep(SimpleNamespace(db=str(tmp_path / 'orphans.db'), debug=True))
+    output = capsys.readouterr().out
+    assert '"status": "completed"' in output
+    assert '"orphans_embedded": 2' in output
+
+
+def test_injected_encoder_failure_never_falls_back(tmp_path, monkeypatch):
+    from core.embedding_service import LocalBackend
+    conn = _orphan_db(tmp_path, dimension=384)
+    conn.close()
+    monkeypatch.setattr(LocalBackend, '__init__', lambda *a, **kw: pytest.fail('fallback constructed'))
+    def fail(_n):
+        raise RuntimeError('worker unavailable')
+    result = run_sleep_cycle(str(tmp_path / 'orphans.db'), embedding_client=_Client(fail),
+                            embedding_model='all-MiniLM-L6-v2', expected_dimension=384)
+    assert result['error'] == 'orphan_write_failed'
+
+
+def test_repair_preserves_model_identity_per_row(tmp_path):
+    conn = _orphan_db(tmp_path)
+    vector = np.ones(4, dtype=np.float32).tobytes()
+    conn.execute("INSERT INTO embeddings VALUES ('n1', ?, 'old-model', datetime('now'))", (vector,))
+    conn.execute("INSERT INTO thought_nodes(id, content) VALUES ('n2', 'matching')")
+    conn.execute("INSERT INTO embeddings VALUES ('n2', ?, 'new-model', datetime('now'))", (vector,))
+    conn.commit()
+    stats = {}
+    count = _embed_orphans(conn, embedding_client=_Client(None), embedding_model='new-model',
+                           expected_dimension=4, stats=stats)
+    assert count == 1
+    assert stats['orphan_write_failed'] == 1
+    assert conn.execute('SELECT node_id FROM vec_embeddings').fetchall() == [('n2',)]
+    assert conn.execute("SELECT model, vector FROM embeddings WHERE node_id='n1'").fetchone() == ('old-model', vector)
+    conn.close()

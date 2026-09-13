@@ -181,7 +181,7 @@ def _load_embedding_matrix(
             if np.any(np.isnan(vec)) or np.any(np.isinf(vec)):
                 bad += 1
                 continue
-            if np.allclose(vec, 0):
+            if not np.any(vec):
                 bad += 1
                 continue
             if len(vec) != expected_dim:
@@ -532,6 +532,7 @@ def _batch_cross_links(
             original_counts = [1 if repaired else 0 for _, _, repaired in pending_pairs]
             if final_counts == [2] * len(pending_pairs):
                 apply_pending()
+                return True
             elif final_counts != original_counts:
                 publish_progress(uncertain=True)
                 raise
@@ -1295,8 +1296,9 @@ def _embed_orphans(
 ) -> int:
     """Embed active orphans through the caller-owned ``encode`` client.
 
-    The client is injected so sleep never constructs a model or selects a
-    device. Inference happens one bounded batch at a time before its write
+    This helper never constructs a model or selects a device; the entry point
+    supplies the default backend or injected client. Inference happens one
+    bounded batch at a time before its write
     transaction. Each node is dual-written under a savepoint; a loaded vec
     index that rejects a write rolls back the ordinary row as well.
     """
@@ -1512,7 +1514,7 @@ def _embed_orphans(
                         raise ValueError("embedding_shape_mismatch")
                     vectors = [np.asarray(item, dtype=np.float32) for item in array]
                     if any(
-                        not np.all(np.isfinite(vec)) or np.allclose(vec, 0)
+                        not np.all(np.isfinite(vec)) or not np.any(vec)
                         for vec in vectors
                     ):
                         raise ValueError("embedding_invalid")
@@ -1548,7 +1550,7 @@ def _embed_orphans(
                         if (
                             len(vec) != expected
                             or not np.all(np.isfinite(vec))
-                            or np.allclose(vec, 0)
+                            or not np.any(vec)
                         ):
                             raise ValueError("embedding_invalid")
                     except (TypeError, ValueError, BufferError):
@@ -1655,6 +1657,7 @@ def run_sleep_cycle(
     embedding_client=None,
     embedding_model: Optional[str] = None,
     expected_dimension: Optional[int] = None,
+    auto_embed: bool = True,
     journal_policy: str = "manage",
     orphan_limit: Optional[int] = None,
     orphan_batch_size: int = ORPHANS_PER_BATCH,
@@ -1684,6 +1687,10 @@ def run_sleep_cycle(
     cross_source_only : bool
         When True, only cross-link pairs from different ``source_file``
         values (reduces same-source noise).
+    auto_embed : bool
+        Lazily use the configured local encoder when no client is supplied.
+        Set False to forbid automatic model loading. An injected client never
+        falls back to a local encoder, even when it fails.
     orphan_limit : Optional[int]
         Maximum orphan rows examined across both repair passes. ``None`` keeps
         the historical behavior of repairing every eligible orphan.
@@ -1703,6 +1710,8 @@ def run_sleep_cycle(
         if db_path is None:
             db_path = get_db_path()
 
+        if not isinstance(auto_embed, bool):
+            return _empty_sleep_result("rejected", "invalid_auto_embed")
         if journal_policy not in {"manage", "preserve"}:
             return _empty_sleep_result("rejected", "invalid_journal_policy")
         if limit is not None and (not isinstance(limit, int) or limit < 0):
@@ -1744,6 +1753,15 @@ def run_sleep_cycle(
         if all(supplied_embedding) and profile is not None:
             if profile.dim != expected_dimension:
                 return _empty_sleep_result("rejected", "embedding_dimension_mismatch")
+        if not any(supplied_embedding) and auto_embed:
+            from .config import get_embedding_model
+            from .embedding_service import LocalBackend
+
+            embedding_model = get_embedding_model()
+            expected_dimension = profile.dim
+            # LocalBackend loads its model only on encode: empty cycles and
+            # vector-index repairs from stored rows do not load a model.
+            embedding_client = LocalBackend(embedding_model)
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA busy_timeout = 5000")
         if journal_policy == "manage":
@@ -2187,6 +2205,7 @@ class SleepProtocol:
             embedding_client=kwargs.get("embedding_client"),
             embedding_model=kwargs.get("embedding_model"),
             expected_dimension=kwargs.get("expected_dimension"),
+            auto_embed=kwargs.get("auto_embed", True),
             journal_policy=kwargs.get("journal_policy", "manage"),
             orphan_limit=kwargs.get("orphan_limit"),
             orphan_batch_size=kwargs.get("orphan_batch_size", ORPHANS_PER_BATCH),
